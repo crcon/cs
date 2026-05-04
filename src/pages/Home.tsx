@@ -6,7 +6,7 @@ import {
 import { 
   TrendingUp, DollarSign, Activity, Settings, Info, 
   AlertTriangle, Save, RefreshCw, FileText, CheckCircle, FolderOpen, Trash2,
-  LayoutDashboard, Zap, Gauge, Battery, Building2, BookOpen, ScrollText, Database
+  LayoutDashboard, Zap, Gauge, Battery, BatteryWarning, Building2, BookOpen, ScrollText, Database
 } from 'lucide-react';
 
 type SectionKey =
@@ -15,11 +15,15 @@ type SectionKey =
   | 'frequency'
   | 'capacity'
   | 'lease'
-  | 'rules'
-  | 'policy'
+  | 'retirement'
   | 'basics';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
+import {
+  simulateStoragePlant,
+  type SimulationResult,
+  type YearResult,
+} from '../lib/storageSimulation';
 
 /**
  * 财务工具函数：计算IRR (内部收益率)
@@ -72,6 +76,9 @@ export default function ShandongStorageCalculator() {
     efficiency: 0.85,      // 综合效率
     dodDepth: 0.90,        // DOD充放深度
     degradation: 0.02,     // 年衰减率
+    firstYearDeg: 0.00,    // 首年衰减率（0~1）
+    replaceThreshold: 0.80,// 更换阈值 SOH（0~1）
+    enableReplacement: true, // 是否启用衰减达阈后更换电池逻辑
 
     // 投资与融资
     epcPrice: 1.60,        // 元/Wh (PDF基准: 1.6, 调整后建议: 0.98~1.5)
@@ -88,10 +95,18 @@ export default function ShandongStorageCalculator() {
     spotMarketUncertainty: 0.90, // 市场不确定性系数
     tradingLossFactor: 0.95,     // 交易损耗系数
 
-    // 收益 - 容量补偿
-    compStandard: 520000,  // 元/MW/年 (含税标准)
-    kFactor: 2.0,          // K值 (小时)
-    compPolicyCoeff: 0.65, // 政策调整系数 (PDF: 0.65)
+    // 收益 - 容量补偿（青海发电侧容量电价机制）
+    compStandard: 520000,  // [兼容遗留] 元/MW/年
+    kFactor: 2.0,          // [兼容遗留] 旧版可用容量系数（小时）
+    compPolicyCoeff: 0.65, // [兼容遗留] 政策调整系数
+
+    // 青海容量电价新模型参数
+    capSrcType: 'storage' as 'storage' | 'coal' | 'gas' | 'csp', // 电源类型
+    capPriceKW: 165,       // 容量补偿标准 元/(kW·年)（2月稿165 / 4月稿185）
+    capKRatio: 1.04,       // 容量供需系数 K
+    capPeakHours: 4,       // 系统净负荷高峰持续时长 T (h)
+    capAuxRate: 10.39,     // 厂用电率 %（储能10.39 / 燃煤6.05 / 燃气3.75 / 光热21.53）
+    capDeclareRatio: 100,  // 申报容量比例 %
     
     // 收益 - 容量租赁
     leasePrice: 250,       // 元/kW/年
@@ -108,7 +123,27 @@ export default function ShandongStorageCalculator() {
     discountRate: 0.08,    // 基准折现率
   });
 
-  // --- 2. 实时核心测算逻辑 ---
+  // --- 2. 全生命周期衰减 / 更换仿真（与 params 联动） ---
+  const lifeCycleSim = useMemo<SimulationResult>(() => {
+    // 将 年循环次数 = cyclesPerDay × runDays 均衰为月均索引
+    const annualCycles = params.cyclesPerDay * params.runDays;
+    const perMonth = annualCycles / 365; // 配合 useActualMonthDays=true
+    const monthlyCycles = Array(12).fill(perMonth);
+    return simulateStoragePlant({
+      operationYears: params.lifeSpan,
+      nominalCapacity: params.capacityMWh,
+      systemEfficiency: params.efficiency,
+      dod: params.dodDepth,
+      monthlyCycles,
+      firstYearDegradation: params.firstYearDeg,
+      annualDegradation: params.degradation,
+      maxCyclesLimit: 10000,
+      replaceThreshold: params.enableReplacement ? params.replaceThreshold : 0, // 0 代表从不触发更换
+      useActualMonthDays: true,
+    });
+  }, [params.lifeSpan, params.capacityMWh, params.efficiency, params.dodDepth, params.cyclesPerDay, params.runDays, params.firstYearDeg, params.degradation, params.replaceThreshold, params.enableReplacement]);
+
+  // --- 3. 实时核心测算逻辑 ---
 
   const results = useMemo(() => {
     // A. 投资概算
@@ -126,8 +161,10 @@ export default function ShandongStorageCalculator() {
 
     for (let year = 1; year <= params.lifeSpan; year++) {
       // 1. 物理参数
-      // 电池实际可用容量衰减
-      const degradFactor = Math.pow(1 - params.degradation, year - 1);
+      // 电池实际可用容量衰减：优先采用全生命周期仿真结果（含更换后 SOH 回升逻辑）
+      const simRow = lifeCycleSim.rows.find(r => r.year === year);
+      const sohAvg = simRow ? 0.5 * (simRow.sohStart + simRow.sohEnd) : Math.pow(1 - params.degradation, year - 1);
+      const degradFactor = sohAvg;
       const availableMWh = params.capacityMWh * degradFactor;
       
       // 2. 收入测算 (万元)
@@ -142,20 +179,21 @@ export default function ShandongStorageCalculator() {
       // 修正后实际收入 (考虑不确定性 & 损耗)
       const spotIncome = theoreticalSpotIncome * params.spotMarketUncertainty * params.tradingLossFactor;
 
-      // (2) 容量补偿
-      // 依据用户图片公式重构:
-      // 1. 确定储能的“可用容量” (Effective Capacity)
-      //    U_可用 = (P_装机 * h_放电) / 24
-      // 2. 计算年度容量补偿金额
-      //    容量补偿(元/年) = U_可用 * 标准(52)
-      
-      // 计算有效容量 (MW) - 注意：不再除以2
-      const effectiveCapacity = (params.capacityMW * params.kFactor) / 24; 
-      
-      // 计算年收入 (万元)
-      // params.compStandard 单位是 元/MW/年，除以10000转为万元
-      // 保留 compPolicyCoeff 作为政策调整系数(如0.65)，图片虽未提，但实务中必有考核或折扣
-      const compIncome = effectiveCapacity * (params.compStandard / 10000) * params.compPolicyCoeff;
+      // (2) 容量补偿（青海省发电侧容量电价机制 / 可靠容量补偿）
+      // 公式（储能）：年度容量电费 = 申报容量(kW) × K × 容量补偿标准(元/kW·年)
+      //   申报容量 = 有效容量 × 申报比例
+      //   有效容量 = P × (1 − 厂用电率) × MIN(满功率放电时长 / T, 100%)
+      //   满功率放电时长 = E ÷ P
+      const _capAuxR = (params.capAuxRate || 0) / 100;
+      const _capDur = params.capacityMW > 0 ? params.capacityMWh / params.capacityMW : 0;
+      const _capT = params.capPeakHours || 1;
+      const _capReliCoef = params.capSrcType === 'storage'
+        ? (1 - _capAuxR) * Math.min(_capDur / _capT, 1)
+        : (1 - _capAuxR);
+      const _capEffMW = params.capacityMW * _capReliCoef;
+      const _capDeclMW = _capEffMW * (params.capDeclareRatio / 100);
+      // 年度容量电费(万元) = 申报容量(kW) × K × 单价(元/kW·年) ÷ 10000
+      const compIncome = (_capDeclMW * 1000) * params.capKRatio * params.capPriceKW / 10000;
 
       // (3) 容量租赁
       // 年租赁收入(万元) = 装机容量(MW) × 出租率(%) ÷ 100 × 1000(kW/MW) × 租赁单价(元/kW·年) ÷ 10000
@@ -225,6 +263,9 @@ export default function ShandongStorageCalculator() {
         projectNCF,
         equityNCF,
         cost: opex + interest + incomeTax,
+        sohStart: simRow?.sohStart ?? 1,
+        sohEnd: simRow?.sohEnd ?? Math.pow(1 - params.degradation, year),
+        replaced: simRow?.replaced ?? false,
         breakdown: {
           spot: spotIncome,
           comp: compIncome,
@@ -270,7 +311,7 @@ export default function ShandongStorageCalculator() {
       avgRevenue: yearlyData.reduce((a, b) => a + b.revenue, 0) / params.lifeSpan,
       avgNetProfit: yearlyData.reduce((a, b) => a + b.netProfit, 0) / params.lifeSpan
     };
-  }, [params]);
+  }, [params, lifeCycleSim]);
 
   /**
    * 计算基准年放电量（不考虑衰减，用于现货收入展示）
@@ -410,7 +451,7 @@ export default function ShandongStorageCalculator() {
         remainH -= pageH;
       }
       const dateStr = new Date().toLocaleDateString('zh-CN').replace(/\//g, '-');
-      pdf.save(`山东储能测算报告_${dateStr}.pdf`);
+      pdf.save(`易储数智能源_储能测算报告_${dateStr}.pdf`);
       showNotification('success', 'PDF 报告已导出！');
     } catch (err) {
       console.error('[ExportPDF] 失败：', err);
@@ -552,7 +593,7 @@ export default function ShandongStorageCalculator() {
         {/* 侧边栏导航 */}
         <aside className="w-56 shrink-0 bg-slate-900 text-slate-200 flex flex-col sticky top-0 h-screen">
           <div className="px-5 py-5 border-b border-slate-800 flex items-center gap-3">
-            <div className="bg-blue-600 rounded-lg w-10 h-10 flex items-center justify-center font-bold text-white">SX</div>
+            <div className="bg-blue-600 rounded-lg w-10 h-10 flex items-center justify-center font-bold text-white text-[10px] leading-tight text-center px-1">易储<br/>数能</div>
             <div className="leading-tight">
               <h1 className="text-sm font-bold">独立储能收益测算</h1>
               <p className="text-[11px] text-slate-400 mt-0.5">易储能源</p>
@@ -565,8 +606,7 @@ export default function ShandongStorageCalculator() {
               { key: 'frequency', label: '调频收益', icon: Gauge },
               { key: 'capacity',  label: '容量电价', icon: Battery },
               { key: 'lease',     label: '容量租赁', icon: Building2 },
-              { key: 'rules',     label: '市场规则', icon: BookOpen },
-              { key: 'policy',    label: '相关政策', icon: ScrollText },
+              { key: 'retirement',label: '电池退役', icon: BatteryWarning },
               { key: 'basics',    label: '基础数据', icon: Database },
             ] as { key: SectionKey; label: string; icon: any }[]).map(item => {
               const Icon = item.icon;
@@ -604,12 +644,11 @@ export default function ShandongStorageCalculator() {
                     frequency: '调频(辅助服务)收益',
                     capacity: '容量电价补偿',
                     lease: '容量租赁收益',
-                    rules: '市场规则',
-                    policy: '相关政策',
+                    retirement: '电池退役 / 全周期衰减模拟',
                     basics: '基础数据与参数',
                   }[activeSection]}
                 </h2>
-                <p className="text-xs text-gray-500 mt-0.5">山东独立储能项目收益测算与运营分析</p>
+                <p className="text-xs text-gray-500 mt-0.5">易储数智能源 | 独立储能项目收益测算与运营分析</p>
               </div>
               <div className="flex gap-3">
                 <button
@@ -641,132 +680,6 @@ export default function ShandongStorageCalculator() {
             {/* ==================== 1. 收益总览 ==================== */}
             {activeSection === 'overview' && (
               <>
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
-                    <div className="absolute top-0 right-0 w-16 h-16 bg-blue-50 rounded-bl-full -mr-4 -mt-4"></div>
-                    <p className="text-sm text-gray-500 font-medium relative z-10">全投资 IRR</p>
-                    <p className={`text-2xl font-bold mt-1 relative z-10 ${results.projectIRR > 0.08 ? 'text-blue-600' : 'text-red-500'}`}>
-                      {formatPercent(results.projectIRR)}
-                    </p>
-                    <p className="text-xs text-gray-400 mt-2">资本金IRR: <span className="text-gray-700 font-semibold">{formatPercent(results.equityIRR)}</span></p>
-                  </div>
-                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
-                    <div className="absolute top-0 right-0 w-16 h-16 bg-green-50 rounded-bl-full -mr-4 -mt-4"></div>
-                    <p className="text-sm text-gray-500 font-medium relative z-10">总投资额</p>
-                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
-                      {(results.totalInvestment / 10000 / 10000).toFixed(2)} <span className="text-sm font-normal text-gray-500">亿元</span>
-                    </p>
-                    <p className="text-xs text-gray-400 mt-2">单位投资: {params.epcPrice} 元/Wh</p>
-                  </div>
-                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
-                    <div className="absolute top-0 right-0 w-16 h-16 bg-purple-50 rounded-bl-full -mr-4 -mt-4"></div>
-                    <p className="text-sm text-gray-500 font-medium relative z-10">静态回收期</p>
-                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
-                      {results.paybackPeriod.toFixed(1)} <span className="text-sm font-normal text-gray-500">年</span>
-                    </p>
-                    <p className="text-xs text-gray-400 mt-2">项目NPV: {(results.npv / 10000).toFixed(0)} 万元</p>
-                  </div>
-                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
-                    <div className="absolute top-0 right-0 w-16 h-16 bg-orange-50 rounded-bl-full -mr-4 -mt-4"></div>
-                    <p className="text-sm text-gray-500 font-medium relative z-10">首年总收入</p>
-                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
-                      {formatNumber(results.yearlyData[0].revenue)} <span className="text-sm font-normal text-gray-500">万元</span>
-                    </p>
-                    <p className="text-xs text-gray-400 mt-2">净利润: {formatNumber(results.yearlyData[0].netProfit)} 万元</p>
-                  </div>
-                </div>
-
-                <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-                  <div className="flex items-center justify-between mb-6">
-                    <h3 className="text-lg font-bold text-gray-800">全生命周期现金流分析</h3>
-                    <div className="flex items-center gap-3 text-xs text-gray-500">
-                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-blue-500"></span>当年净现金流</span>
-                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-green-500"></span>年收入</span>
-                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-purple-400"></span>净利润</span>
-                    </div>
-                  </div>
-                  <div className="h-[350px] w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <ComposedChart data={results.yearlyData}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
-                        <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12, fill: '#666'}} />
-                        <YAxis yAxisId="left" orientation="left" tickLine={false} axisLine={false} tick={{fontSize: 12, fill: '#666'}} label={{ value: '万元', angle: -90, position: 'insideLeft', style: {fill: '#999'} }} />
-                        <YAxis yAxisId="right" orientation="right" tickLine={false} axisLine={false} hide />
-                        <RechartsTooltip 
-                          contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                          formatter={(value: number) => formatNumber(value)}
-                        />
-                        <Bar yAxisId="left" dataKey="projectNCF" fill="#3b82f6" radius={[4, 4, 0, 0]} barSize={20} name="当年净现金流" />
-                        <Line yAxisId="left" type="monotone" dataKey="revenue" stroke="#10b981" strokeWidth={2} dot={false} name="年收入" />
-                        <Area yAxisId="left" type="monotone" dataKey="netProfit" fill="#8b5cf6" stroke="#8b5cf6" fillOpacity={0.1} name="净利润" />
-                      </ComposedChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-                    <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-lg font-bold text-gray-800">首年收入构成</h3>
-                      <span className="text-sm font-bold text-blue-600 bg-blue-50 px-3 py-1 rounded-lg border border-blue-100">
-                        合计 {formatNumber(results.yearlyData[0].revenue)} 万元
-                      </span>
-                    </div>
-                    <div className="space-y-4">
-                      {[
-                        { label: '现货套利', value: results.yearlyData[0].breakdown.spot, color: 'bg-blue-500' },
-                        { label: '容量补偿', value: results.yearlyData[0].breakdown.comp, color: 'bg-purple-500' },
-                        { label: '容量租赁', value: results.yearlyData[0].breakdown.lease, color: 'bg-green-500' },
-                        { label: '辅助服务', value: results.yearlyData[0].breakdown.aux, color: 'bg-orange-500' },
-                      ].map((item, idx) => {
-                        const total = results.yearlyData[0].revenue;
-                        const percent = total > 0 ? (item.value / total) * 100 : 0;
-                        return (
-                          <div key={idx}>
-                            <div className="flex justify-between text-sm mb-1">
-                              <span className="text-gray-600">{item.label}</span>
-                              <span className="font-medium">{formatNumber(item.value)}万 ({percent.toFixed(1)}%)</span>
-                            </div>
-                            <div className="w-full bg-gray-100 rounded-full h-2">
-                              <div className={`h-2 rounded-full ${item.color}`} style={{ width: `${percent}%` }}></div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-                    <h3 className="text-lg font-bold text-gray-800 mb-4">财务指标校验</h3>
-                    <div className="space-y-3 text-sm">
-                      <div className="flex justify-between border-b border-gray-100 pb-2">
-                        <span className="text-gray-500">初始总投资 (CAPEX)</span>
-                        <span className="font-mono">{(results.totalInvestment / 10000).toFixed(0)} 万元</span>
-                      </div>
-                      <div className="flex justify-between border-b border-gray-100 pb-2">
-                        <span className="text-gray-500">自有资金 (Equity)</span>
-                        <span className="font-mono text-blue-600">{(results.equityAmount / 10000).toFixed(0)} 万元</span>
-                      </div>
-                      <div className="flex justify-between border-b border-gray-100 pb-2">
-                        <span className="text-gray-500">银行贷款 (Debt)</span>
-                        <span className="font-mono">{(results.debtAmount / 10000).toFixed(0)} 万元</span>
-                      </div>
-                      <div className="flex justify-between border-b border-gray-100 pb-2">
-                        <span className="text-gray-500">全生命周期总营收</span>
-                        <span className="font-mono">{(results.yearlyData.reduce((a,b)=>a+b.revenue,0)).toFixed(0)} 万元</span>
-                      </div>
-                      <div className="flex justify-between border-b border-gray-100 pb-2">
-                        <span className="text-gray-500">全生命周期总净利</span>
-                        <span className="font-mono text-green-600">{(results.yearlyData.reduce((a,b)=>a+b.netProfit,0)).toFixed(0)} 万元</span>
-                      </div>
-                      <div className="flex justify-between pt-2">
-                        <span className="text-gray-500 font-medium">净现值 (NPV @{(params.discountRate*100).toFixed(0)}%)</span>
-                        <span className="font-bold text-gray-800">{(results.npv / 10000).toFixed(0)} 万元</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
                 <section className="relative overflow-hidden rounded-[28px] border border-slate-800 bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_24%),radial-gradient(circle_at_bottom_right,_rgba(124,58,237,0.16),_transparent_24%),linear-gradient(135deg,_#07111f_0%,_#0b1830_45%,_#111827_100%)] p-6 md:p-8 shadow-[0_24px_80px_rgba(15,23,42,0.28)]">
                   <div className="pointer-events-none absolute inset-0 opacity-40">
                     <div className="absolute left-10 top-10 h-32 w-32 rounded-full bg-cyan-400/10 blur-3xl"></div>
@@ -899,74 +812,139 @@ export default function ShandongStorageCalculator() {
                     </div>
                   </div>
                 </section>
+
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-blue-50 rounded-bl-full -mr-4 -mt-4"></div>
+                    <p className="text-sm text-gray-500 font-medium relative z-10">全投资 IRR</p>
+                    <p className={`text-2xl font-bold mt-1 relative z-10 ${results.projectIRR > 0.08 ? 'text-blue-600' : 'text-red-500'}`}>
+                      {formatPercent(results.projectIRR)}
+                    </p>
+                    <p className="text-xs text-gray-400 mt-2">资本金IRR: <span className="text-gray-700 font-semibold">{formatPercent(results.equityIRR)}</span></p>
+                  </div>
+                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-green-50 rounded-bl-full -mr-4 -mt-4"></div>
+                    <p className="text-sm text-gray-500 font-medium relative z-10">总投资额</p>
+                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
+                      {(results.totalInvestment / 10000 / 10000).toFixed(2)} <span className="text-sm font-normal text-gray-500">亿元</span>
+                    </p>
+                    <p className="text-xs text-gray-400 mt-2">单位投资: {params.epcPrice} 元/Wh</p>
+                  </div>
+                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-purple-50 rounded-bl-full -mr-4 -mt-4"></div>
+                    <p className="text-sm text-gray-500 font-medium relative z-10">静态回收期</p>
+                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
+                      {results.paybackPeriod.toFixed(1)} <span className="text-sm font-normal text-gray-500">年</span>
+                    </p>
+                    <p className="text-xs text-gray-400 mt-2">项目NPV: {(results.npv / 10000).toFixed(0)} 万元</p>
+                  </div>
+                  <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-orange-50 rounded-bl-full -mr-4 -mt-4"></div>
+                    <p className="text-sm text-gray-500 font-medium relative z-10">首年总收入</p>
+                    <p className="text-2xl font-bold text-gray-900 mt-1 relative z-10">
+                      {formatNumber(results.yearlyData[0].revenue)} <span className="text-sm font-normal text-gray-500">万元</span>
+                    </p>
+                    <p className="text-xs text-gray-400 mt-2">净利润: {formatNumber(results.yearlyData[0].netProfit)} 万元</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="text-lg font-bold text-gray-800">全生命周期现金流分析</h3>
+                    <div className="flex items-center gap-3 text-xs text-gray-500">
+                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-blue-500"></span>当年净现金流</span>
+                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-green-500"></span>年收入</span>
+                      <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-purple-400"></span>净利润</span>
+                    </div>
+                  </div>
+                  <div className="h-[350px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart data={results.yearlyData}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                        <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12, fill: '#666'}} />
+                        <YAxis yAxisId="left" orientation="left" tickLine={false} axisLine={false} tick={{fontSize: 12, fill: '#666'}} label={{ value: '万元', angle: -90, position: 'insideLeft', style: {fill: '#999'} }} />
+                        <YAxis yAxisId="right" orientation="right" tickLine={false} axisLine={false} hide />
+                        <RechartsTooltip 
+                          contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                          formatter={(value: number) => formatNumber(value)}
+                        />
+                        <Bar yAxisId="left" dataKey="projectNCF" fill="#3b82f6" radius={[4, 4, 0, 0]} barSize={20} name="当年净现金流" />
+                        <Line yAxisId="left" type="monotone" dataKey="revenue" stroke="#10b981" strokeWidth={2} dot={false} name="年收入" />
+                        <Area yAxisId="left" type="monotone" dataKey="netProfit" fill="#8b5cf6" stroke="#8b5cf6" fillOpacity={0.1} name="净利润" />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-lg font-bold text-gray-800">首年收入构成</h3>
+                      <span className="text-sm font-bold text-blue-600 bg-blue-50 px-3 py-1 rounded-lg border border-blue-100">
+                        合计 {formatNumber(results.yearlyData[0].revenue)} 万元
+                      </span>
+                    </div>
+                    <div className="space-y-4">
+                      {[
+                        { label: '现货套利', value: results.yearlyData[0].breakdown.spot, color: 'bg-blue-500' },
+                        { label: '容量补偿', value: results.yearlyData[0].breakdown.comp, color: 'bg-purple-500' },
+                        { label: '容量租赁', value: results.yearlyData[0].breakdown.lease, color: 'bg-green-500' },
+                        { label: '辅助服务', value: results.yearlyData[0].breakdown.aux, color: 'bg-orange-500' },
+                      ].map((item, idx) => {
+                        const total = results.yearlyData[0].revenue;
+                        const percent = total > 0 ? (item.value / total) * 100 : 0;
+                        return (
+                          <div key={idx}>
+                            <div className="flex justify-between text-sm mb-1">
+                              <span className="text-gray-600">{item.label}</span>
+                              <span className="font-medium">{formatNumber(item.value)}万 ({percent.toFixed(1)}%)</span>
+                            </div>
+                            <div className="w-full bg-gray-100 rounded-full h-2">
+                              <div className={`h-2 rounded-full ${item.color}`} style={{ width: `${percent}%` }}></div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                    <h3 className="text-lg font-bold text-gray-800 mb-4">财务指标校验</h3>
+                    <div className="space-y-3 text-sm">
+                      <div className="flex justify-between border-b border-gray-100 pb-2">
+                        <span className="text-gray-500">初始总投资 (CAPEX)</span>
+                        <span className="font-mono">{(results.totalInvestment / 10000).toFixed(0)} 万元</span>
+                      </div>
+                      <div className="flex justify-between border-b border-gray-100 pb-2">
+                        <span className="text-gray-500">自有资金 (Equity)</span>
+                        <span className="font-mono text-blue-600">{(results.equityAmount / 10000).toFixed(0)} 万元</span>
+                      </div>
+                      <div className="flex justify-between border-b border-gray-100 pb-2">
+                        <span className="text-gray-500">银行贷款 (Debt)</span>
+                        <span className="font-mono">{(results.debtAmount / 10000).toFixed(0)} 万元</span>
+                      </div>
+                      <div className="flex justify-between border-b border-gray-100 pb-2">
+                        <span className="text-gray-500">全生命周期总营收</span>
+                        <span className="font-mono">{(results.yearlyData.reduce((a,b)=>a+b.revenue,0)).toFixed(0)} 万元</span>
+                      </div>
+                      <div className="flex justify-between border-b border-gray-100 pb-2">
+                        <span className="text-gray-500">全生命周期总净利</span>
+                        <span className="font-mono text-green-600">{(results.yearlyData.reduce((a,b)=>a+b.netProfit,0)).toFixed(0)} 万元</span>
+                      </div>
+                      <div className="flex justify-between pt-2">
+                        <span className="text-gray-500 font-medium">净现值 (NPV @{(params.discountRate*100).toFixed(0)}%)</span>
+                        <span className="font-bold text-gray-800">{(results.npv / 10000).toFixed(0)} 万元</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </>
             )}
 
             {/* ==================== 2. 现货交易 ==================== */}
             {activeSection === 'spot' && (
               <div className="space-y-5">
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                <div className="lg:col-span-5 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                  <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
-                    <Zap size={16} className="text-blue-600" />
-                    <h3 className="font-semibold text-gray-800">现货套利参数</h3>
-                  </div>
-                  <div className="p-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <InputField label="日循环次数" unit="次" value={params.cyclesPerDay} onChange={(v:any)=>setParams({...params, cyclesPerDay:v})} />
-                      <InputField label="年运行天数" unit="天" value={params.runDays} onChange={(v:any)=>setParams({...params, runDays:v})} />
-                    </div>
-                    <InputField label="现货净价差" unit="元/kWh" step={0.0001} value={params.spotSpread} onChange={(v:any)=>setParams({...params, spotSpread:v})} tooltip="PDF基准: 0.4509" />
-                    <InputField label="价差年增长率" unit="小数(0.02=2%)" step={0.001} value={params.spotSpreadGrowth} onChange={(v:any)=>setParams({...params, spotSpreadGrowth:v})} tooltip="按年复合增长，输入小数：0=持平，0.02 表示每年+2%。保守建议取 0" />
-                    <div className="bg-blue-50 border border-blue-100 rounded-md p-3 text-xs text-blue-900 mb-3 space-y-1">
-                      <div className="flex justify-between"><span>当前值（{(params.spotSpreadGrowth*100).toFixed(1)}%/年）</span><span className="font-mono">第1年 {params.spotSpread.toFixed(4)} 元/kWh</span></div>
-                      <div className="flex justify-between"><span>第 5 年价差</span><span className="font-mono">{(params.spotSpread * Math.pow(1+params.spotSpreadGrowth, 4)).toFixed(4)}</span></div>
-                      <div className="flex justify-between"><span>第 {params.lifeSpan} 年价差</span><span className="font-mono">{(params.spotSpread * Math.pow(1+params.spotSpreadGrowth, params.lifeSpan-1)).toFixed(4)}</span></div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4 bg-yellow-50 p-3 rounded-md border border-yellow-100">
-                      <InputField label="市场不确定系数" unit="%" step={0.01} value={params.spotMarketUncertainty} onChange={(v:any)=>setParams({...params, spotMarketUncertainty:v})} tooltip="预测偏差修正 (默认0.9)" />
-                      <InputField label="交易损耗系数" unit="%" step={0.01} value={params.tradingLossFactor} onChange={(v:any)=>setParams({...params, tradingLossFactor:v})} tooltip="调度/考核损耗 (默认0.95)" />
-                    </div>
-                  </div>
-                </div>
-                <div className="lg:col-span-7 space-y-3">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">理论年放电量</p>
-                      <p className="text-xl font-bold text-gray-900 mt-1">{formatNumber(annualDischargeMWh)} <span className="text-sm font-normal text-gray-500">MWh</span></p>
-                      <p className="text-xs text-gray-400 mt-1">≈ {formatNumber(annualDischargeMWh / 10)} 万kWh</p>
-                    </div>
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">首年现货收入(修正后)</p>
-                      <p className="text-xl font-bold text-blue-600 mt-1">{formatNumber(results.yearlyData[0].breakdown.spot)} <span className="text-sm font-normal text-gray-500">万元</span></p>
-                      <p className="text-xs text-gray-400 mt-1">占总收入 {((results.yearlyData[0].breakdown.spot / results.yearlyData[0].revenue)*100).toFixed(1)}%</p>
-                    </div>
-                  </div>
-                  <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
-                    <h3 className="text-sm font-bold text-gray-800 mb-3">逐年现货收入 (含衰减)</h3>
-                    <div className="h-[220px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={results.yearlyData}>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
-                          <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
-                          <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} label={{ value: '万元', angle: -90, position: 'insideLeft', style: {fill: '#999'} }} />
-                          <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
-                          <Bar dataKey="breakdown.spot" fill="#3b82f6" radius={[4,4,0,0]} name="现货套利" />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm text-blue-900 flex gap-2">
-                    <Info size={16} className="mt-0.5 shrink-0" />
-                    <div>
-                      <p className="font-medium mb-1">计算口径：</p>
-                      <p>现货收入 = 装机容量(衰减后) × 日循环次数 × 年运行天数 × 综合效率 × 净价差 × 市场不确定系数 × 交易损耗系数。</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* —— 数据实时展示舱（科技绿 · 海报风） —— */}
+              {/* —— 数据实时展示舱（科技绿 · 海报风）· 置顶 —— */}
               <section className="relative overflow-hidden rounded-[28px] border border-emerald-400/15 bg-[linear-gradient(135deg,_#03140d_0%,_#062b1f_45%,_#03140d_100%)] p-6 md:p-10 shadow-[0_24px_80px_rgba(5,46,33,0.45)]">
                 <div className="pointer-events-none absolute inset-0 opacity-60">
                   <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-emerald-400/15 blur-[100px]"></div>
@@ -1063,6 +1041,68 @@ export default function ShandongStorageCalculator() {
                   <span>SYS: 容量 {formatNumber(params.capacityMWh)} MWh · 时长 {params.systemDuration} h · 综合效率 {(params.efficiency*100).toFixed(1)}% · DOD {(params.dodDepth*100).toFixed(1)}%</span>
                 </div>
               </section>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                <div className="lg:col-span-5 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                  <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                    <Zap size={16} className="text-blue-600" />
+                    <h3 className="font-semibold text-gray-800">现货套利参数</h3>
+                  </div>
+                  <div className="p-4">
+                    <div className="grid grid-cols-2 gap-4">
+                      <InputField label="日循环次数" unit="次" value={params.cyclesPerDay} onChange={(v:any)=>setParams({...params, cyclesPerDay:v})} />
+                      <InputField label="年运行天数" unit="天" value={params.runDays} onChange={(v:any)=>setParams({...params, runDays:v})} />
+                    </div>
+                    <InputField label="现货净价差" unit="元/kWh" step={0.0001} value={params.spotSpread} onChange={(v:any)=>setParams({...params, spotSpread:v})} tooltip="PDF基准: 0.4509" />
+                    <InputField label="价差年增长率" unit="小数(0.02=2%)" step={0.001} value={params.spotSpreadGrowth} onChange={(v:any)=>setParams({...params, spotSpreadGrowth:v})} tooltip="按年复合增长，输入小数：0=持平，0.02 表示每年+2%。保守建议取 0" />
+                    <div className="bg-blue-50 border border-blue-100 rounded-md p-3 text-xs text-blue-900 mb-3 space-y-1">
+                      <div className="flex justify-between"><span>当前值（{(params.spotSpreadGrowth*100).toFixed(1)}%/年）</span><span className="font-mono">第1年 {params.spotSpread.toFixed(4)} 元/kWh</span></div>
+                      <div className="flex justify-between"><span>第 5 年价差</span><span className="font-mono">{(params.spotSpread * Math.pow(1+params.spotSpreadGrowth, 4)).toFixed(4)}</span></div>
+                      <div className="flex justify-between"><span>第 {params.lifeSpan} 年价差</span><span className="font-mono">{(params.spotSpread * Math.pow(1+params.spotSpreadGrowth, params.lifeSpan-1)).toFixed(4)}</span></div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4 bg-yellow-50 p-3 rounded-md border border-yellow-100">
+                      <InputField label="市场不确定系数" unit="%" step={0.01} value={params.spotMarketUncertainty} onChange={(v:any)=>setParams({...params, spotMarketUncertainty:v})} tooltip="预测偏差修正 (默认0.9)" />
+                      <InputField label="交易损耗系数" unit="%" step={0.01} value={params.tradingLossFactor} onChange={(v:any)=>setParams({...params, tradingLossFactor:v})} tooltip="调度/考核损耗 (默认0.95)" />
+                    </div>
+                  </div>
+                </div>
+                <div className="lg:col-span-7 space-y-3">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                      <p className="text-xs text-gray-500">理论年放电量</p>
+                      <p className="text-xl font-bold text-gray-900 mt-1">{formatNumber(annualDischargeMWh)} <span className="text-sm font-normal text-gray-500">MWh</span></p>
+                      <p className="text-xs text-gray-400 mt-1">≈ {formatNumber(annualDischargeMWh / 10)} 万kWh</p>
+                    </div>
+                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                      <p className="text-xs text-gray-500">首年现货收入(修正后)</p>
+                      <p className="text-xl font-bold text-blue-600 mt-1">{formatNumber(results.yearlyData[0].breakdown.spot)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                      <p className="text-xs text-gray-400 mt-1">占总收入 {((results.yearlyData[0].breakdown.spot / results.yearlyData[0].revenue)*100).toFixed(1)}%</p>
+                    </div>
+                  </div>
+                  <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h3 className="text-sm font-bold text-gray-800 mb-3">逐年现货收入 (含衰减)</h3>
+                    <div className="h-[220px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={results.yearlyData}>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                          <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
+                          <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} label={{ value: '万元', angle: -90, position: 'insideLeft', style: {fill: '#999'} }} />
+                          <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
+                          <Bar dataKey="breakdown.spot" fill="#3b82f6" radius={[4,4,0,0]} name="现货套利" />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm text-blue-900 flex gap-2">
+                    <Info size={16} className="mt-0.5 shrink-0" />
+                    <div>
+                      <p className="font-medium mb-1">计算口径：</p>
+                      <p>现货收入 = 装机容量(衰减后) × 日循环次数 × 年运行天数 × 综合效率 × 净价差 × 市场不确定系数 × 交易损耗系数。</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               </div>
             )}
 
@@ -1111,160 +1151,871 @@ export default function ShandongStorageCalculator() {
               </div>
             )}
 
-            {/* ==================== 4. 容量电价 ==================== */}
-            {activeSection === 'capacity' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                <div className="lg:col-span-5 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                  <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
-                    <Battery size={16} className="text-purple-600" />
-                    <h3 className="font-semibold text-gray-800">容量补偿参数</h3>
+            {/* ==================== 4. 容量电价（青海发电侧容量电价 / 可靠容量补偿） ==================== */}
+            {activeSection === 'capacity' && (() => {
+              const auxDefaultMap: Record<string, number> = { storage: 10.39, coal: 6.05, gas: 3.75, csp: 21.53 };
+              const typeNameMap: Record<string, string> = { storage: '新型储能', coal: '燃煤', gas: '燃气', csp: '光热' };
+              const isStorage = params.capSrcType === 'storage';
+              const auxR = (params.capAuxRate || 0) / 100;
+              const dur = params.capacityMW > 0 ? params.capacityMWh / params.capacityMW : 0;
+              const T = params.capPeakHours || 1;
+              const reliCoef = isStorage
+                ? (1 - auxR) * Math.min(dur / T, 1)
+                : (1 - auxR);
+              const effMW = params.capacityMW * reliCoef;
+              const declMW = effMW * (params.capDeclareRatio / 100);
+              const declKW = declMW * 1000;
+              const yearFee = declKW * params.capKRatio * params.capPriceKW; // 元
+              const monthFee = yearFee / 12;
+              const perKw = params.capacityMW > 0 ? yearFee / (params.capacityMW * 1000) : 0;
+              const firstYearComp = results.yearlyData[0]?.breakdown.comp ?? 0;
+              const totalRev0 = results.yearlyData[0]?.revenue ?? 1;
+
+              return (
+                <div className="space-y-4">
+                  {/* 顶部品牌条 */}
+                  <div className="rounded-xl p-4 text-white shadow-sm" style={{ background: 'linear-gradient(135deg,#0b6cf2,#0a8f5b)' }}>
+                    <h3 className="text-base font-bold">易储能源 | 独立储能电站容量电价测算工具</h3>
+                    <p className="text-xs opacity-90 mt-1">
+                      依据《关于建立青海省发电侧容量电价机制的通知（征求意见稿）》及《青海省发电侧可靠容量补偿机制（征求意见稿）》 ·
+                      仅测算 <b>容量电价收入</b>，不含电能量市场与辅助服务收益
+                    </p>
                   </div>
-                  <div className="p-4">
-                    <div className="text-xs text-gray-500 flex items-start gap-1 mb-3">
-                      <Info size={12} className="mt-0.5 shrink-0"/>
-                      <span>当前系统时长 <strong>{params.systemDuration}h</strong>，容量 <strong>{params.capacityMWh.toFixed(1)} MWh</strong></span>
+
+                  {/* 数据实时展示舱 // 容量电价（科技绿 · 海报风） */}
+                  <section className="relative overflow-hidden rounded-[28px] border border-emerald-400/15 bg-[linear-gradient(135deg,_#03140d_0%,_#062b1f_45%,_#03140d_100%)] p-6 md:p-10 shadow-[0_24px_80px_rgba(5,46,33,0.45)]">
+                    <div className="pointer-events-none absolute inset-0 opacity-60">
+                      <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-emerald-400/15 blur-[100px]"></div>
+                      <div className="absolute right-0 bottom-0 h-72 w-72 rounded-full bg-teal-300/10 blur-[120px]"></div>
+                      <div className="absolute inset-0 bg-[linear-gradient(rgba(16,185,129,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.06)_1px,transparent_1px)] bg-[size:48px_48px]"></div>
+                      <div className="absolute inset-x-10 top-24 h-px bg-gradient-to-r from-transparent via-emerald-300/40 to-transparent"></div>
                     </div>
-                    <div className="grid grid-cols-2 gap-4">
-                      <InputField label="核定放电时长(h)" unit="h" step={0.1} value={params.kFactor} onChange={(v:any)=>setParams({...params, kFactor: Math.min(v, params.systemDuration)})} tooltip={`政策核定放电时长 h_放电，通常不超过系统时长 ${params.systemDuration}h`} />
-                      <InputField label="政策调整系数" unit="-" value={params.compPolicyCoeff} onChange={(v:any)=>setParams({...params, compPolicyCoeff:v})} tooltip="考虑实际考核打折，默认0.65" />
+
+                    <div className="relative flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-8">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-emerald-300/80">REAL-TIME DATA HUB</p>
+                        <h3 className="mt-2 text-2xl md:text-3xl font-bold text-white tracking-wide">数据实时展示舱 <span className="text-emerald-300">// 容量电价</span></h3>
+                        <p className="mt-2 max-w-xl text-sm text-emerald-100/70">基于当前参数实时演算的容量电价核心指标，可直接作为路演 / 海报展示。</p>
+                      </div>
+                      <div className="inline-flex items-center gap-2 rounded-full border border-emerald-300/30 bg-emerald-400/10 px-4 py-2 text-xs text-emerald-100 backdrop-blur-sm">
+                        <span className="relative flex h-2 w-2">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-70"></span>
+                          <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,0.9)]"></span>
+                        </span>
+                        LIVE · {new Date().toLocaleTimeString('zh-CN', { hour12: false })}
+                      </div>
                     </div>
-                    <InputField label="火电基准补偿单价" unit="元/MW/年" value={params.compStandard} onChange={(v:any)=>setParams({...params, compStandard:v})} tooltip="图片示例: 52万元/MW·年" />
-                    <div className="bg-purple-50 border border-purple-100 rounded-md p-3 text-xs text-purple-900 mt-2">
-                      可用容量 ≈ <strong>{(params.capacityMW * params.kFactor / 24).toFixed(2)} MW</strong> = (装机功率 × 核定放电时长) ÷ 24
+
+                    <div className={`relative grid grid-cols-2 ${isStorage ? 'lg:grid-cols-6' : 'lg:grid-cols-5'} gap-5`}>
+                      {([
+                        ...(isStorage ? [{
+                          key: 'duration',
+                          label: '满功率放电时长',
+                          sub: 'Full-Power Duration',
+                          value: dur.toFixed(2),
+                          unit: 'h',
+                          hint: `E ${params.capacityMWh.toFixed(1)} MWh ÷ P ${params.capacityMW} MW`,
+                        }] : []),
+                        {
+                          key: 'reli',
+                          label: '可靠容量系数',
+                          sub: 'Reliable Capacity Factor',
+                          value: (reliCoef * 100).toFixed(2) + '%',
+                          unit: '',
+                          hint: `(1 − ${params.capAuxRate}%) × MIN(h/T, 100%)`,
+                        },
+                        {
+                          key: 'eff',
+                          label: '有效容量',
+                          sub: 'Effective Capacity',
+                          value: effMW.toFixed(2),
+                          unit: 'MW',
+                          hint: `${declKW.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} kW (申报)`,
+                        },
+                        {
+                          key: 'year',
+                          label: '年度容量电费',
+                          sub: 'Annual Capacity Fee',
+                          value: (yearFee / 10000).toFixed(2),
+                          unit: '万元',
+                          hint: `${yearFee.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} 元/年`,
+                        },
+                        {
+                          key: 'month',
+                          label: '月度容量电费',
+                          sub: 'Monthly Capacity Fee',
+                          value: (monthFee / 10000).toFixed(2),
+                          unit: '万元',
+                          hint: `年费 ÷ 12`,
+                        },
+                        {
+                          key: 'perKw',
+                          label: '单位装机容量电费',
+                          sub: 'Unit Capacity Fee',
+                          value: perKw.toFixed(2),
+                          unit: '元/(kW·年)',
+                          hint: `含 K 与可靠容量系数后等效值`,
+                        },
+                      ] as Array<{ key: string; label: string; sub: string; value: string; unit: string; hint: string }>).map((it, idx) => (
+                        <div
+                          key={it.key}
+                          className="group relative overflow-hidden rounded-2xl border border-emerald-300/15 bg-[linear-gradient(160deg,rgba(6,78,59,0.55)_0%,rgba(2,20,14,0.85)_100%)] p-5 backdrop-blur-md transition-all duration-300 hover:-translate-y-1 hover:border-emerald-300/40 hover:shadow-[0_18px_60px_rgba(16,185,129,0.25)]"
+                        >
+                          <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-300 to-transparent opacity-70"></div>
+                          <div className="absolute -right-10 -top-10 h-28 w-28 rounded-full bg-emerald-400/10 blur-2xl transition-opacity duration-300 group-hover:opacity-80"></div>
+                          <div className="absolute right-3 top-3 font-mono text-[10px] tracking-widest text-emerald-300/60">0{idx + 1}</div>
+
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-300/70">{it.sub}</p>
+                          <p className="mt-1 text-sm font-medium text-emerald-50">{it.label}</p>
+
+                          <div className="mt-5 flex items-baseline gap-2">
+                            <span className="text-[2.0rem] font-bold leading-none tracking-tight bg-gradient-to-br from-white via-emerald-100 to-emerald-300 bg-clip-text text-transparent">
+                              {it.value}
+                            </span>
+                            {it.unit && <span className="text-xs text-emerald-200/70">{it.unit}</span>}
+                          </div>
+
+                          <div className="mt-5 flex items-center justify-between text-[11px] text-emerald-200/60">
+                            <span className="font-mono truncate" title={it.hint}>{it.hint}</span>
+                            <span className="inline-flex items-center gap-1 text-emerald-300 shrink-0">
+                              <span className="h-1 w-1 rounded-full bg-emerald-300 shadow-[0_0_6px_rgba(110,231,183,0.9)]"></span>
+                              ONLINE
+                            </span>
+                          </div>
+
+                          <div className="mt-4 h-1 rounded-full bg-emerald-900/40 overflow-hidden">
+                            <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-emerald-200 group-hover:w-full transition-all duration-700"></div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
+
+                    <div className="relative mt-6 flex flex-wrap items-center justify-between gap-3 text-[11px] text-emerald-200/50 font-mono">
+                      <span>// SOURCE: capacity-price-engine v1.0 · 实时演算</span>
+                      <span>SYS: P {params.capacityMW} MW · E {params.capacityMWh.toFixed(1)} MWh · K {params.capKRatio} · 单价 {params.capPriceKW} 元/(kW·年) · T {params.capPeakHours} h</span>
+                    </div>
+                  </section>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                    {/* 政策参数 */}
+                    <div className="lg:col-span-6 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-600 text-white text-[11px] font-bold">①</span>
+                        <h3 className="font-semibold text-gray-800">政策参数</h3>
+                        <span className="ml-auto text-[11px] text-gray-500">2月稿:165/1.04/4h · 4月稿:185/0.92/8h</span>
+                      </div>
+                      <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <InputField label="容量补偿标准" unit="元/(kW·年)" step={1} value={params.capPriceKW}
+                          onChange={(v: number) => setParams({ ...params, capPriceKW: v })}
+                          tooltip="单位有效容量每年获得的补偿。2026年青海初定 165，4月稿拟提至 185" />
+                        <InputField label="容量供需系数 K" unit="-" step={0.01} value={params.capKRatio}
+                          onChange={(v: number) => setParams({ ...params, capKRatio: v })}
+                          tooltip=">1 容量不足，激励投资；<1 容量富余，补偿打折。按年核定" />
+                        <InputField label="净负荷高峰持续时长 T" unit="小时" step={0.5} value={params.capPeakHours}
+                          onChange={(v: number) => setParams({ ...params, capPeakHours: v })}
+                          tooltip="近3年净负荷高峰对应时段最大持续小时数。该参数对储能影响最大" />
+                      </div>
+                      <div className="px-4 pb-4 -mt-1">
+                        <div className="rounded-md border border-sky-100 bg-sky-50 px-3 py-2 text-[12px] leading-relaxed text-sky-900">
+                          <b>核心公式：</b>容量电费 = 申报容量(kW) × 容量供需系数 K × 容量补偿标准(元/kW·年)
+                          <br />申报容量 ≤ 有效容量；有效容量随电源类型差异显著
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 项目技术参数 */}
+                    <div className="lg:col-span-6 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-600 text-white text-[11px] font-bold">②</span>
+                        <h3 className="font-semibold text-gray-800">项目技术参数</h3>
+                        <span className="ml-auto text-[11px] text-gray-500">P/E 与「基础数据」实时同步</span>
+                      </div>
+                      <div className="p-4 space-y-3">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div className="mb-0">
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-sm font-medium text-gray-700">电源类型</label>
+                              <span className="text-xs text-gray-500">-</span>
+                            </div>
+                            <select
+                              value={params.capSrcType}
+                              onChange={(e) => {
+                                const v = e.target.value as typeof params.capSrcType;
+                                setParams({ ...params, capSrcType: v, capAuxRate: auxDefaultMap[v] });
+                              }}
+                              className="w-full px-3 py-2 text-sm border rounded-md border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            >
+                              <option value="storage">新型储能（独立、未参与配储）</option>
+                              <option value="coal">燃煤发电</option>
+                              <option value="gas">燃气发电</option>
+                              <option value="csp">光热发电（未享其他补贴）</option>
+                            </select>
+                          </div>
+                          <InputField label="厂用电率" unit="%" step={0.01} value={params.capAuxRate}
+                            onChange={(v: number) => setParams({ ...params, capAuxRate: v })}
+                            tooltip="燃煤6.05% / 燃气3.75% / 光热21.53% / 储能10.39%" />
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          <InputField label="额定/最大功率 P" unit="MW" step={1} value={params.capacityMW}
+                            onChange={(v: number) => {
+                              const newDuration = v > 0 ? +(params.capacityMWh / v).toFixed(3) : params.systemDuration;
+                              setParams({ ...params, capacityMW: v, systemDuration: newDuration });
+                            }}
+                            tooltip="与基础数据同步；储能为最大放电功率" />
+                          {isStorage && (
+                            <>
+                              <InputField label="放电时长 h" unit="小时" step={0.5} value={params.systemDuration}
+                                onChange={(v: number) => {
+                                  const newMWh = +(params.capacityMW * v).toFixed(2);
+                                  setParams({ ...params, systemDuration: v, capacityMWh: newMWh });
+                                }}
+                                tooltip="储能额定电量 E = P × h（自动计算）" />
+                              <div className="mb-0">
+                                <div className="flex items-center justify-between mb-1">
+                                  <label className="text-sm font-medium text-gray-700">储能电量 E</label>
+                                  <span className="text-xs text-gray-500">MWh</span>
+                                </div>
+                                <input
+                                  type="number"
+                                  readOnly
+                                  value={params.capacityMWh}
+                                  className="w-full px-3 py-2 text-sm border rounded-md border-gray-200 bg-gray-100 text-gray-700"
+                                />
+                              </div>
+                            </>
+                          )}
+                          <InputField label="申报容量比例" unit="%" step={1} value={params.capDeclareRatio}
+                            onChange={(v: number) => setParams({ ...params, capDeclareRatio: v })}
+                            tooltip="申报容量占有效容量比例（≤100%）。机组按月申报，不得超核定有效容量" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 计算过程 + 图表 */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                    <div className="lg:col-span-7 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-600 text-white text-[11px] font-bold">③</span>
+                        <h3 className="font-semibold text-gray-800">测算结果 · 计算过程</h3>
+                      </div>
+                      <div className="p-4 space-y-2 text-[12.5px] font-mono leading-relaxed">
+                        {isStorage ? (
+                          <>
+                            <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                              储能电量 E = {params.capacityMW} MW × {params.systemDuration} h = <b>{params.capacityMWh.toFixed(1)} MWh</b>
+                            </div>
+                            <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                              满功率放电时长 = {params.capacityMWh.toFixed(1)} ÷ {params.capacityMW} = <b>{dur.toFixed(2)} 小时</b>
+                            </div>
+                            <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                              可靠容量系数 = (1 − {params.capAuxRate}%) × MIN({dur.toFixed(2)}/{T}, 100%) = {((1 - auxR) * 100).toFixed(2)}% × {(Math.min(dur / T, 1) * 100).toFixed(2)}% = <b>{(reliCoef * 100).toFixed(2)}%</b>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                            有效容量 = {params.capacityMW} MW × (1 − {params.capAuxRate}%) = <b>{effMW.toFixed(2)} MW</b>（{typeNameMap[params.capSrcType]}不计可靠容量系数）
+                          </div>
+                        )}
+                        {isStorage && (
+                          <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                            有效容量 = {params.capacityMW} MW × {(reliCoef * 100).toFixed(2)}% = <b>{effMW.toFixed(2)} MW</b>
+                          </div>
+                        )}
+                        <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                          申报容量 = {effMW.toFixed(2)} × {params.capDeclareRatio}% = <b>{declMW.toFixed(2)} MW = {declKW.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} kW</b>
+                        </div>
+                        <div className="bg-amber-50 border-l-[3px] border-amber-500 rounded px-3 py-2 text-gray-700">
+                          年度容量电费 = {declKW.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} kW × {params.capKRatio} × {params.capPriceKW} 元 = <b>{(yearFee / 10000).toFixed(2)} 万元</b>
+                        </div>
+                      </div>
+                      <details className="px-4 pb-4">
+                        <summary className="cursor-pointer text-sm font-semibold text-blue-600 py-1">展开：公式逐项说明</summary>
+                        <div className="mt-2 space-y-1 text-[12px] font-mono text-gray-700">
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">① 满功率放电时长 = 储能电量 E ÷ 功率 P</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">② 可靠容量系数（仅储能）= (1 − 厂用电率) × MIN(满功率放电时长 ÷ T, 100%)</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">③ 有效容量（火/气/光热）= 额定容量 × (1 − 厂用电率)</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">④ 有效容量（储能）= 最大放电功率 × 可靠容量系数</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">⑤ 申报容量 = 有效容量 × 申报比例</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">⑥ 年度容量电费 = 申报容量(kW) × K × 容量补偿标准</div>
+                          <div className="bg-gray-50 border border-dashed border-gray-300 rounded px-3 py-1.5">⑦ 单位装机容量电费 = 年度容量电费 ÷ 装机功率(kW)</div>
+                        </div>
+                      </details>
+                    </div>
+
+                    <div className="lg:col-span-5 space-y-3">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                          <p className="text-xs text-gray-500">首年容量补偿</p>
+                          <p className="text-xl font-bold text-purple-600 mt-1">{formatNumber(firstYearComp)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                          <p className="text-xs text-gray-400 mt-1">占总收入 {((firstYearComp / totalRev0) * 100).toFixed(1)}%</p>
+                        </div>
+                        <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                          <p className="text-xs text-gray-500">有效容量</p>
+                          <p className="text-xl font-bold text-gray-900 mt-1">{effMW.toFixed(2)} <span className="text-sm font-normal text-gray-500">MW</span></p>
+                          <p className="text-xs text-gray-400 mt-1">{typeNameMap[params.capSrcType]} · K={params.capKRatio}</p>
+                        </div>
+                      </div>
+                      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                        <h3 className="text-sm font-bold text-gray-800 mb-3">逐年容量补偿（含 SOH 与基础数据联动后的实际入账值）</h3>
+                        <div className="h-[240px] w-full">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={results.yearlyData}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                              <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{ fontSize: 12 }} />
+                              <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12 }} />
+                              <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
+                              <Bar dataKey="breakdown.comp" fill="#a855f7" radius={[4, 4, 0, 0]} name="容量补偿" />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 核心计算公式 */}
+                  <div className="rounded-md border-l-[3px] border-sky-500 bg-sky-50/60 px-4 py-3 text-[12.5px] leading-relaxed text-sky-900">
+                    <b>核心计算公式：</b>
+                    <ol className="list-decimal pl-5 mt-1 space-y-1">
+                      <li><b>容量电费</b> = 机组申报容量 × 容量供需系数 × 容量补偿标准</li>
+                      <li><b>容量供需系数</b> = 系统可靠容量需求 / 系统可靠容量供给</li>
+                      <li>
+                        <b>系统净负荷</b> = 省内负荷（含线损）+ 外送需求 + 备用容量 − 省内风光出力 − 季调节及以下水电出力 − 外购电力 − 可中断负荷
+                        <span className="ml-1 text-sky-700">（关联“鸭子曲线”效应）</span>
+                      </li>
+                      <li><b>可靠容量系数</b> = (1 − 厂用电率) × MIN(满功率放电时长 / 系统净负荷高峰持续时长, 100%)</li>
+                    </ol>
                   </div>
                 </div>
-                <div className="lg:col-span-7 space-y-3">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">首年容量补偿</p>
-                      <p className="text-xl font-bold text-purple-600 mt-1">{formatNumber(results.yearlyData[0].breakdown.comp)} <span className="text-sm font-normal text-gray-500">万元</span></p>
-                      <p className="text-xs text-gray-400 mt-1">占总收入 {((results.yearlyData[0].breakdown.comp / results.yearlyData[0].revenue)*100).toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">可用容量</p>
-                      <p className="text-xl font-bold text-gray-900 mt-1">{(params.capacityMW * params.kFactor / 24).toFixed(2)} <span className="text-sm font-normal text-gray-500">MW</span></p>
-                      <p className="text-xs text-gray-400 mt-1">基于核定 {params.kFactor}h 放电</p>
-                    </div>
-                  </div>
-                  <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
-                    <h3 className="text-sm font-bold text-gray-800 mb-3">逐年容量补偿</h3>
-                    <div className="h-[220px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={results.yearlyData}>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
-                          <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
-                          <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} />
-                          <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
-                          <Bar dataKey="breakdown.comp" fill="#a855f7" radius={[4,4,0,0]} name="容量补偿" />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* ==================== 5. 容量租赁 ==================== */}
-            {activeSection === 'lease' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                <div className="lg:col-span-5 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                  <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
-                    <Building2 size={16} className="text-green-600" />
-                    <h3 className="font-semibold text-gray-800">容量租赁参数</h3>
-                  </div>
-                  <div className="p-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <InputField label="租赁单价" unit="元/kW·年" value={params.leasePrice} onChange={(v:any)=>setParams({...params, leasePrice:v})} tooltip="容量租赁单价，示例：250 元/kW·年" />
-                      <InputField label="出租率" unit="%" step={1} value={params.leaseRatio} onChange={(v:any)=>setParams({...params, leaseRatio:v})} tooltip="百分比口径，例如 50 表示 50% 出租" />
-                    </div>
-                    <div className="bg-green-50 border border-green-100 rounded-md p-3 text-xs text-green-900 mt-2">
-                      年租赁收入 = 装机功率(kW) × 出租率 × 租赁单价
-                    </div>
-                  </div>
-                </div>
-                <div className="lg:col-span-7 space-y-3">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">首年租赁收入</p>
-                      <p className="text-xl font-bold text-green-600 mt-1">{formatNumber(results.yearlyData[0].breakdown.lease)} <span className="text-sm font-normal text-gray-500">万元</span></p>
-                      <p className="text-xs text-gray-400 mt-1">占总收入 {((results.yearlyData[0].breakdown.lease / results.yearlyData[0].revenue)*100).toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
-                      <p className="text-xs text-gray-500">出租容量</p>
-                      <p className="text-xl font-bold text-gray-900 mt-1">{(params.capacityMW * params.leaseRatio / 100).toFixed(2)} <span className="text-sm font-normal text-gray-500">MW</span></p>
-                      <p className="text-xs text-gray-400 mt-1">出租率 {params.leaseRatio}%</p>
-                    </div>
-                  </div>
-                  <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
-                    <h3 className="text-sm font-bold text-gray-800 mb-3">逐年租赁收入</h3>
-                    <div className="h-[220px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={results.yearlyData}>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
-                          <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
-                          <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} />
-                          <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
-                          <Bar dataKey="breakdown.lease" fill="#10b981" radius={[4,4,0,0]} name="容量租赁" />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
+            {activeSection === 'lease' && (() => {
+              const leaseMW = params.capacityMW * params.leaseRatio / 100;
+              const leaseKW = leaseMW * 1000;
+              const yearLeaseFee = leaseKW * params.leasePrice; // 元
+              const monthLeaseFee = yearLeaseFee / 12;
+              const firstYearLease = results.yearlyData[0]?.breakdown.lease ?? 0;
+              const totalRev0 = results.yearlyData[0]?.revenue ?? 1;
+              const lifeLease = firstYearLease * params.lifeSpan; // 万元
 
-            {/* ==================== 6. 市场规则 ==================== */}
-            {activeSection === 'rules' && (
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 space-y-6">
-                <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2"><BookOpen size={18} className="text-blue-600"/>山东电力现货 / 辅助服务市场规则摘要</h3>
-                <ul className="space-y-3 text-sm text-gray-700 list-disc pl-5">
-                  <li><strong>交易品种：</strong>日前现货、实时现货、二次调频(AGC)、备用、调峰等。</li>
-                  <li><strong>报价时段：</strong>按 00:00–06:00、06:00–12:00、12:00–16:00、16:00–21:00、21:00–24:00 五个分时段申报。</li>
-                  <li><strong>出清机制：</strong>排序价格 = 申报价 × 归一化历史性能，按排序结果出清并出清。</li>
-                  <li><strong>结算公式：</strong>调频收益 = 实际调节深度 D × 性能折算值 Ksettle × 调节里程单价。</li>
-                  <li><strong>储能补偿：</strong>独立储能可参与调峰、容量补偿，被授予容量价值。</li>
-                  <li><strong>风险提示：</strong>容量电价无政策担保，公开规则与考核办法逐年调整，建议在投资评估中保留口径折让。</li>
-                </ul>
-              </div>
-            )}
+              return (
+                <div className="space-y-4">
+                  {/* 数据实时展示舱 // 容量租赁（科技绿 · 海报风） */}
+                  <section className="relative overflow-hidden rounded-[28px] border border-emerald-400/15 bg-[linear-gradient(135deg,_#03140d_0%,_#062b1f_45%,_#03140d_100%)] p-6 md:p-10 shadow-[0_24px_80px_rgba(5,46,33,0.45)]">
+                    <div className="pointer-events-none absolute inset-0 opacity-60">
+                      <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-emerald-400/15 blur-[100px]"></div>
+                      <div className="absolute right-0 bottom-0 h-72 w-72 rounded-full bg-teal-300/10 blur-[120px]"></div>
+                      <div className="absolute inset-0 bg-[linear-gradient(rgba(16,185,129,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.06)_1px,transparent_1px)] bg-[size:48px_48px]"></div>
+                      <div className="absolute inset-x-10 top-24 h-px bg-gradient-to-r from-transparent via-emerald-300/40 to-transparent"></div>
+                    </div>
 
-            {/* ==================== 7. 相关政策 ==================== */}
-            {activeSection === 'policy' && (
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 space-y-6">
-                <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2"><ScrollText size={18} className="text-blue-600"/>相关政策梳理</h3>
-                <div className="space-y-5 text-sm text-gray-700">
-                  <div>
-                    <p className="font-semibold text-gray-800 mb-1">国家层面</p>
-                    <ul className="list-disc pl-5 space-y-1 text-gray-600">
-                      <li>《关于加快推动新型储能发展的指导意见》(发改能源〔2022〕475号)</li>
-                      <li>《关于加快建设新型电力系统的指导意见》</li>
-                      <li>新型储能项目管理办法 — 独立储能可作为独立市场主体参与电力市场。</li>
-                    </ul>
-                  </div>
-                  <div>
-                    <p className="font-semibold text-gray-800 mb-1">山东省层面</p>
-                    <ul className="list-disc pl-5 space-y-1 text-gray-600">
-                      <li>《山东省电力现货市场交易规则》</li>
-                      <li>《山东省电力辅助服务市场运营规则》</li>
-                      <li>《关于支持新型储能产业发展的若干政策措施》— 含容量补偿、容量租赁、即征即退等。</li>
-                    </ul>
-                  </div>
-                  <div>
-                    <p className="font-semibold text-gray-800 mb-1">税收 / 金融</p>
-                    <ul className="list-disc pl-5 space-y-1 text-gray-600">
-                      <li>增值税即征即退 50% (绿色能源)。</li>
-                      <li>高新技术企业所得税 15% / 一般 25%。</li>
-                      <li>绿色信贷利率优惠区间约 3.8%–4.5%。</li>
-                    </ul>
+                    <div className="relative flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-8">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-emerald-300/80">REAL-TIME DATA HUB</p>
+                        <h3 className="mt-2 text-2xl md:text-3xl font-bold text-white tracking-wide">数据实时展示舱 <span className="text-emerald-300">// 容量租赁</span></h3>
+                        <p className="mt-2 max-w-xl text-sm text-emerald-100/70">基于当前参数实时演算的容量租赁核心指标，可直接作为路演 / 海报展示。</p>
+                      </div>
+                      <div className="inline-flex items-center gap-2 rounded-full border border-emerald-300/30 bg-emerald-400/10 px-4 py-2 text-xs text-emerald-100 backdrop-blur-sm">
+                        <span className="relative flex h-2 w-2">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-70"></span>
+                          <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,0.9)]"></span>
+                        </span>
+                        LIVE · {new Date().toLocaleTimeString('zh-CN', { hour12: false })}
+                      </div>
+                    </div>
+
+                    <div className="relative grid grid-cols-2 lg:grid-cols-5 gap-5">
+                      {[
+                        {
+                          key: 'leaseMW',
+                          label: '出租容量',
+                          sub: 'Leased Capacity',
+                          value: leaseMW.toFixed(2),
+                          unit: 'MW',
+                          hint: `出租率 ${params.leaseRatio}% · ${leaseKW.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} kW`,
+                        },
+                        {
+                          key: 'price',
+                          label: '租赁单价',
+                          sub: 'Lease Unit Price',
+                          value: formatNumber(params.leasePrice),
+                          unit: '元/(kW·年)',
+                          hint: `按合同口径不随 SOH 折算`,
+                        },
+                        {
+                          key: 'year',
+                          label: '首年租赁收入',
+                          sub: 'First-Year Lease Income',
+                          value: formatNumber(firstYearLease),
+                          unit: '万元',
+                          hint: `占总收入 ${((firstYearLease / totalRev0) * 100).toFixed(1)}%`,
+                        },
+                        {
+                          key: 'month',
+                          label: '月度租赁收入',
+                          sub: 'Monthly Lease Income',
+                          value: (monthLeaseFee / 10000).toFixed(2),
+                          unit: '万元',
+                          hint: `年费 ÷ 12`,
+                        },
+                        {
+                          key: 'life',
+                          label: '全周期租赁收入',
+                          sub: 'Lifetime Lease Income',
+                          value: formatNumber(lifeLease),
+                          unit: '万元',
+                          hint: `${params.lifeSpan} 年 · 按当前口径估算`,
+                        },
+                      ].map((it, idx) => (
+                        <div
+                          key={it.key}
+                          className="group relative overflow-hidden rounded-2xl border border-emerald-300/15 bg-[linear-gradient(160deg,rgba(6,78,59,0.55)_0%,rgba(2,20,14,0.85)_100%)] p-5 backdrop-blur-md transition-all duration-300 hover:-translate-y-1 hover:border-emerald-300/40 hover:shadow-[0_18px_60px_rgba(16,185,129,0.25)]"
+                        >
+                          <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-300 to-transparent opacity-70"></div>
+                          <div className="absolute -right-10 -top-10 h-28 w-28 rounded-full bg-emerald-400/10 blur-2xl transition-opacity duration-300 group-hover:opacity-80"></div>
+                          <div className="absolute right-3 top-3 font-mono text-[10px] tracking-widest text-emerald-300/60">0{idx + 1}</div>
+
+                          <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-300/70">{it.sub}</p>
+                          <p className="mt-1 text-sm font-medium text-emerald-50">{it.label}</p>
+
+                          <div className="mt-5 flex items-baseline gap-2">
+                            <span className="text-[2.0rem] font-bold leading-none tracking-tight bg-gradient-to-br from-white via-emerald-100 to-emerald-300 bg-clip-text text-transparent">
+                              {it.value}
+                            </span>
+                            {it.unit && <span className="text-xs text-emerald-200/70">{it.unit}</span>}
+                          </div>
+
+                          <div className="mt-5 flex items-center justify-between text-[11px] text-emerald-200/60">
+                            <span className="font-mono truncate" title={it.hint}>{it.hint}</span>
+                            <span className="inline-flex items-center gap-1 text-emerald-300 shrink-0">
+                              <span className="h-1 w-1 rounded-full bg-emerald-300 shadow-[0_0_6px_rgba(110,231,183,0.9)]"></span>
+                              ONLINE
+                            </span>
+                          </div>
+
+                          <div className="mt-4 h-1 rounded-full bg-emerald-900/40 overflow-hidden">
+                            <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-emerald-200 group-hover:w-full transition-all duration-700"></div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="relative mt-6 flex flex-wrap items-center justify-between gap-3 text-[11px] text-emerald-200/50 font-mono">
+                      <span>// SOURCE: capacity-lease-engine v1.0 · 实时演算</span>
+                      <span>SYS: P {params.capacityMW} MW · 出租率 {params.leaseRatio}% · 单价 {params.leasePrice} 元/(kW·年) · 年限 {params.lifeSpan}</span>
+                    </div>
+                  </section>
+
+                  {/* 参数 + 概要 + 图表 */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                    <div className="lg:col-span-5 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <Building2 size={16} className="text-green-600" />
+                        <h3 className="font-semibold text-gray-800">容量租赁参数</h3>
+                      </div>
+                      <div className="p-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <InputField label="租赁单价" unit="元/kW·年" value={params.leasePrice} onChange={(v:any)=>setParams({...params, leasePrice:v})} tooltip="容量租赁单价，示例：250 元/kW·年" />
+                          <InputField label="出租率" unit="%" step={1} value={params.leaseRatio} onChange={(v:any)=>setParams({...params, leaseRatio:v})} tooltip="百分比口径，例如 50 表示 50% 出租" />
+                        </div>
+                        <div className="bg-green-50 border border-green-100 rounded-md p-3 text-xs text-green-900 mt-2">
+                          年租赁收入 = 装机功率(kW) × 出租率 × 租赁单价
+                        </div>
+                      </div>
+                    </div>
+                    <div className="lg:col-span-7 space-y-3">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                          <p className="text-xs text-gray-500">首年租赁收入</p>
+                          <p className="text-xl font-bold text-green-600 mt-1">{formatNumber(firstYearLease)} <span className="text-sm font-normal text-gray-500">万元</span></p>
+                          <p className="text-xs text-gray-400 mt-1">占总收入 {((firstYearLease / totalRev0)*100).toFixed(1)}%</p>
+                        </div>
+                        <div className="bg-white p-3.5 rounded-xl shadow-sm border border-gray-100">
+                          <p className="text-xs text-gray-500">出租容量</p>
+                          <p className="text-xl font-bold text-gray-900 mt-1">{leaseMW.toFixed(2)} <span className="text-sm font-normal text-gray-500">MW</span></p>
+                          <p className="text-xs text-gray-400 mt-1">出租率 {params.leaseRatio}%</p>
+                        </div>
+                      </div>
+                      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                        <h3 className="text-sm font-bold text-gray-800 mb-3">逐年租赁收入</h3>
+                        <div className="h-[220px] w-full">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={results.yearlyData}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                              <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12}} />
+                              <YAxis tickLine={false} axisLine={false} tick={{fontSize: 12}} />
+                              <RechartsTooltip formatter={(v: number) => formatNumber(v) + ' 万元'} />
+                              <Bar dataKey="breakdown.lease" fill="#10b981" radius={[4,4,0,0]} name="容量租赁" />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
+
+            {/* ==================== 5.5 电池退役 / 全生命周期衰减 ==================== */}
+            {activeSection === 'retirement' && (() => {
+              const rows: YearResult[] = lifeCycleSim.rows;
+              const totalEnergyMWh = lifeCycleSim.totalEnergyMWh;
+              const replacementYears = lifeCycleSim.replacementYears;
+              const avgAnnualEnergyMWh = params.lifeSpan > 0 ? totalEnergyMWh / params.lifeSpan : 0;
+              const formatPct = (v: number): string => {
+                if (!Number.isFinite(v)) return '-';
+                return `${(v * 100).toFixed(1)}%`;
+              };
+              const finalSoh = rows.length > 0 ? rows[rows.length - 1].sohEnd : 1;
+              const avgSoh = rows.length > 0 ? rows.reduce((s, r) => s + (r.sohStart + r.sohEnd) / 2, 0) / rows.length : 1;
+              const totalCycles = rows.reduce((s, r) => s + (r.annualCycles || 0), 0);
+              return (
+                <div className="space-y-5">
+                {/* —— 数据实时展示舱（科技绿 · 海报风）· 置顶 —— */}
+                <section className="relative overflow-hidden rounded-[28px] border border-emerald-400/15 bg-[linear-gradient(135deg,_#03140d_0%,_#062b1f_45%,_#03140d_100%)] p-6 md:p-10 shadow-[0_24px_80px_rgba(5,46,33,0.45)]">
+                  <div className="pointer-events-none absolute inset-0 opacity-60">
+                    <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-emerald-400/15 blur-[100px]"></div>
+                    <div className="absolute right-0 bottom-0 h-72 w-72 rounded-full bg-teal-300/10 blur-[120px]"></div>
+                    <div className="absolute inset-0 bg-[linear-gradient(rgba(16,185,129,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.06)_1px,transparent_1px)] bg-[size:48px_48px]"></div>
+                    <div className="absolute inset-x-10 top-24 h-px bg-gradient-to-r from-transparent via-emerald-300/40 to-transparent"></div>
+                  </div>
+
+                  <div className="relative flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-8">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-emerald-300/80">REAL-TIME DATA HUB</p>
+                      <h3 className="mt-2 text-2xl md:text-3xl font-bold text-white tracking-wide">数据实时展示舱 <span className="text-emerald-300">// 容量租赁全周期衰减模拟</span></h3>
+                      <p className="mt-2 max-w-xl text-sm text-emerald-100/70">基于 SOH 衰减模型实时演算的全生命周期核心指标，可直接作为路演 / 海报展示。</p>
+                    </div>
+                    <div className="inline-flex items-center gap-2 rounded-full border border-emerald-300/30 bg-emerald-400/10 px-4 py-2 text-xs text-emerald-100 backdrop-blur-sm">
+                      <span className="relative flex h-2 w-2">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-70"></span>
+                        <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,0.9)]"></span>
+                      </span>
+                      LIVE · {new Date().toLocaleTimeString('zh-CN', { hour12: false })}
+                    </div>
+                  </div>
+
+                  <div className="relative grid grid-cols-2 lg:grid-cols-5 gap-5">
+                    {[
+                      {
+                        key: 'totalEnergy',
+                        label: '全周期总放电量',
+                        sub: 'Lifecycle Discharge',
+                        value: formatNumber(totalEnergyMWh),
+                        unit: 'MWh',
+                        hint: `≈ ${(totalEnergyMWh / 100000).toFixed(2)} 亿 kWh`,
+                      },
+                      {
+                        key: 'avgEnergy',
+                        label: '年均放电量',
+                        sub: 'Avg Annual Discharge',
+                        value: formatNumber(avgAnnualEnergyMWh),
+                        unit: 'MWh/年',
+                        hint: `${(avgAnnualEnergyMWh / 100000).toFixed(2)} 亿 kWh/年`,
+                      },
+                      {
+                        key: 'finalSoh',
+                        label: '末年 SOH',
+                        sub: 'Final-Year SOH',
+                        value: formatPct(finalSoh),
+                        unit: '',
+                        hint: `周期均值 ${formatPct(avgSoh)}`,
+                      },
+                      {
+                        key: 'totalCycles',
+                        label: '全周期循环次数',
+                        sub: 'Total Cycles',
+                        value: formatNumber(totalCycles),
+                        unit: '次',
+                        hint: `${(params.cyclesPerDay * params.runDays).toFixed(0)} 次/年 × ${params.lifeSpan} 年`,
+                      },
+                      {
+                        key: 'replace',
+                        label: '电池更换次数',
+                        sub: 'Replacements',
+                        value: `${replacementYears.length}`,
+                        unit: '次',
+                        hint: replacementYears.length === 0 ? '未触发阈值更换' : `年份: ${replacementYears.join('/')}`,
+                      },
+                    ].map((it, idx) => (
+                      <div
+                        key={it.key}
+                        className="group relative overflow-hidden rounded-2xl border border-emerald-300/15 bg-[linear-gradient(160deg,rgba(6,78,59,0.55)_0%,rgba(2,20,14,0.85)_100%)] p-5 backdrop-blur-md transition-all duration-300 hover:-translate-y-1 hover:border-emerald-300/40 hover:shadow-[0_18px_60px_rgba(16,185,129,0.25)]"
+                      >
+                        <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-300 to-transparent opacity-70"></div>
+                        <div className="absolute -right-10 -top-10 h-28 w-28 rounded-full bg-emerald-400/10 blur-2xl transition-opacity duration-300 group-hover:opacity-80"></div>
+                        <div className="absolute right-3 top-3 font-mono text-[10px] tracking-widest text-emerald-300/60">0{idx + 1}</div>
+
+                        <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-300/70">{it.sub}</p>
+                        <p className="mt-1 text-sm font-medium text-emerald-50">{it.label}</p>
+
+                        <div className="mt-5 flex items-baseline gap-2">
+                          <span className="text-[2.2rem] font-bold leading-none tracking-tight bg-gradient-to-br from-white via-emerald-100 to-emerald-300 bg-clip-text text-transparent">
+                            {it.value}
+                          </span>
+                          {it.unit && <span className="text-xs text-emerald-200/70">{it.unit}</span>}
+                        </div>
+
+                        <div className="mt-5 flex items-center justify-between text-[11px] text-emerald-200/60">
+                          <span className="font-mono truncate">{it.hint}</span>
+                          <span className="inline-flex items-center gap-1 text-emerald-300 shrink-0">
+                            <span className="h-1 w-1 rounded-full bg-emerald-300 shadow-[0_0_6px_rgba(110,231,183,0.9)]"></span>
+                            ONLINE
+                          </span>
+                        </div>
+
+                        <div className="mt-4 h-1 rounded-full bg-emerald-900/40 overflow-hidden">
+                          <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-emerald-200 group-hover:w-full transition-all duration-700"></div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="relative mt-6 flex flex-wrap items-center justify-between gap-3 text-[11px] text-emerald-200/50 font-mono">
+                    <span>// SOURCE: lifecycle-degradation-engine v2.6 · 实时演算</span>
+                    <span>SYS: 运营 {params.lifeSpan} 年 · 容量 {formatNumber(params.capacityMWh)} MWh · 首年衰减 {(params.firstYearDeg*100).toFixed(2)}% · 年衰减 {(params.degradation*100).toFixed(2)}% · 阈值 {(params.replaceThreshold*100).toFixed(0)}%</span>
+                  </div>
+                </section>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                  {/* 左：核心参数（与基础数据联动） */}
+                  <div className="lg:col-span-7 space-y-4">
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <BatteryWarning size={16} className="text-amber-600" />
+                        <h3 className="font-semibold text-gray-800">衰减与更换参数</h3>
+                        <span className="ml-auto text-[11px] text-gray-500">与「基础数据」实时同步</span>
+                      </div>
+                      <div className="p-4 space-y-4">
+                        <div className="grid grid-cols-3 gap-3">
+                          <InputField label="运营年限" unit="年" value={params.lifeSpan}
+                            onChange={(v: any) => setParams({ ...params, lifeSpan: v })} />
+                          <InputField label="装机容量" unit="MWh" step={1} value={params.capacityMWh}
+                            onChange={(v: number) => {
+                              const newDuration = params.capacityMW > 0 ? +(v / params.capacityMW).toFixed(3) : params.systemDuration;
+                              setParams({ ...params, capacityMWh: v, systemDuration: newDuration, kFactor: Math.min(params.kFactor, newDuration) });
+                            }}
+                            tooltip="与基础数据中的装机容量同步"
+                          />
+                          <InputField label="综合效率" unit="%" step={0.01} value={params.efficiency}
+                            onChange={(v: any) => setParams({ ...params, efficiency: v })} />
+                        </div>
+                        <div className="grid grid-cols-3 gap-3">
+                          <InputField label="DOD充放深度" unit="%" step={0.01} value={params.dodDepth}
+                            onChange={(v: any) => setParams({ ...params, dodDepth: v })} />
+                          <InputField label="日均循环次数" unit="次/天" step={0.1} value={params.cyclesPerDay}
+                            onChange={(v: any) => setParams({ ...params, cyclesPerDay: v })} />
+                          <InputField label="年运行天数" unit="天" step={1} value={params.runDays}
+                            onChange={(v: any) => setParams({ ...params, runDays: v })} />
+                        </div>
+                        <div className="grid grid-cols-3 gap-3">
+                          <InputField label="首年衰减率" unit="%" step={0.001} value={params.firstYearDeg}
+                            onChange={(v: any) => setParams({ ...params, firstYearDeg: v })}
+                            tooltip="首年累计衰减，常用 0% 或 1%~3%"
+                          />
+                          <InputField label="第2年起年衰减" unit="%" step={0.001} value={params.degradation}
+                            onChange={(v: any) => setParams({ ...params, degradation: v })}
+                            tooltip="第二年起按线性年衰减；与基础数据「年容量衰减率」同源"
+                          />
+                          <InputField label="更换阈值SOH" unit="%" step={0.01} value={params.replaceThreshold}
+                            onChange={(v: any) => setParams({ ...params, replaceThreshold: v })}
+                            tooltip="年末 SOH 低于此阈值则下一年初更换电池，重置为 100%"
+                          />
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-gray-600 pt-1">
+                          <input
+                            type="checkbox"
+                            className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600"
+                            checked={params.enableReplacement}
+                            onChange={(e) => setParams({ ...params, enableReplacement: e.target.checked })}
+                          />
+                          <span>启用「衰减达阈值后更换电池」逻辑（更换后 SOH 回到 100%，并按相同衰减规律重新推演）</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 text-xs text-gray-600">
+                      <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-800">
+                        <Info size={14} className="text-blue-600" /> 勾稽关系与联动说明
+                      </h3>
+                      <ul className="list-disc pl-5 space-y-1.5">
+                        <li>本板块的运营年限、装机容量、综合效率、DOD、日均循环、运行天数、年衰减均与「基础数据」共用同一组参数；任一处修改会实时影响所有板块。</li>
+                        <li>年循环次数 = 日均循环次数 × 年运行天数（{params.cyclesPerDay} × {params.runDays} ≈ {(params.cyclesPerDay * params.runDays).toFixed(0)} 次/年）。</li>
+                        <li>SOH 推演：第 1 年末衰减 = 首年衰减率；第 i 年末衰减 = 首年衰减率 + 年衰减率 × (i-1)。</li>
+                        <li>当年末 SOH &lt; 更换阈值，则下一年初完成更换，电池役龄归零、SOH 恢复至 100%，并按相同规律继续衰减。</li>
+                        <li><strong>收益联动：</strong>现货套利的年放电量 = 装机容量 × 当年平均 SOH × DOD × 综合效率 × 年循环次数；调频/辅助服务收益按 SOH 折算；容量补偿与租赁按合同口径，不随 SOH 折算。</li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  {/* 右：结果概览 */}
+                  <div className="lg:col-span-5 space-y-4">
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <TrendingUp size={16} className="text-emerald-600" />
+                        <h3 className="font-semibold text-gray-800">全周期结果概览</h3>
+                      </div>
+                      <div className="p-4 space-y-3 text-sm">
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="rounded-md bg-blue-50 border border-blue-100 p-3">
+                            <div className="text-xs text-gray-500">全周期总放电量</div>
+                            <div className="mt-1 text-base font-bold text-gray-800 font-mono">
+                              {totalEnergyMWh.toLocaleString(undefined, { maximumFractionDigits: 0 })} MWh
+                            </div>
+                            <div className="text-xs text-gray-500">折算约 {(totalEnergyMWh / 100000).toFixed(2)} 亿 kWh</div>
+                          </div>
+                          <div className="rounded-md bg-emerald-50 border border-emerald-100 p-3">
+                            <div className="text-xs text-gray-500">年均放电量</div>
+                            <div className="mt-1 text-base font-bold text-gray-800 font-mono">
+                              {avgAnnualEnergyMWh.toLocaleString(undefined, { maximumFractionDigits: 0 })} MWh/年
+                            </div>
+                            <div className="text-xs text-gray-500">{(avgAnnualEnergyMWh / 100000).toFixed(2)} 亿 kWh/年</div>
+                          </div>
+                        </div>
+                        <div className="rounded-md bg-amber-50 border border-amber-100 p-3">
+                          <div className="text-xs text-gray-500">电池更换年份（年末判定、下一年初更换）</div>
+                          <div className="mt-1 text-sm font-semibold text-gray-800">
+                            {replacementYears.length === 0 ? '全周期内未触发 SOH 阈值更换' : replacementYears.join('、')}
+                          </div>
+                        </div>
+                        <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs text-gray-500 mb-1">更换次数</div>
+                          <div className="text-sm font-semibold text-gray-800 font-mono">{replacementYears.length} 次</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+                        <Activity size={16} className="text-blue-600" />
+                        <h3 className="font-semibold text-gray-800">SOH 与年放电量曲线</h3>
+                      </div>
+                      <div className="p-4">
+                        <div className="h-[260px] w-full">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <ComposedChart data={rows.map(r => ({
+                              year: r.year,
+                              sohEnd: +(r.sohEnd * 100).toFixed(2),
+                              annualEnergyMWh: Math.round(r.annualEnergyMWh),
+                            }))}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                              <XAxis dataKey="year" tick={{ fontSize: 11 }} />
+                              <YAxis yAxisId="left" tick={{ fontSize: 11 }} domain={[0, 100]} unit="%" />
+                              <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
+                              <RechartsTooltip />
+                              <Legend wrapperStyle={{ fontSize: 11 }} />
+                              <Bar yAxisId="right" dataKey="annualEnergyMWh" name="年放电量(MWh)" fill="#10b981" radius={[3, 3, 0, 0]} />
+                              <Line yAxisId="left" type="monotone" dataKey="sohEnd" name="年末SOH(%)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} />
+                            </ComposedChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 下：逐年明细 */}
+                  <div className="lg:col-span-12">
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                      <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <FileText size={16} className="text-blue-600" />
+                          <h3 className="font-semibold text-gray-800">逐年结果明细</h3>
+                        </div>
+                        <span className="text-xs text-gray-500">列：年份 / 役龄 / 年初 SOH / 年末 SOH / 是否更换 / 循环次数 / 放电量 / 现货收入</span>
+                      </div>
+                      <div className="p-4">
+                        <div className="max-h-[420px] overflow-auto rounded-md border border-gray-200">
+                          <table className="min-w-full border-collapse text-xs">
+                            <thead className="bg-gray-50 text-gray-700 sticky top-0">
+                              <tr>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">年份</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">电池役龄</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">年初 SOH</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">年末 SOH</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">是否更换</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">当年循环次数</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">当年放电量 (MWh)</th>
+                                <th className="border-b border-gray-200 px-3 py-2 text-left font-semibold">现货收入 (万元)</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rows.map((row) => {
+                                const yr = results.yearlyData.find(y => y.year === row.year);
+                                return (
+                                  <tr key={row.year} className={row.replaced ? 'bg-amber-50' : 'odd:bg-white even:bg-gray-50/60'}>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{row.year}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{row.batteryAge}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{formatPct(row.sohStart)}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{formatPct(row.sohEnd)}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5">
+                                      {row.replaced
+                                        ? <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 text-[11px] font-medium">是</span>
+                                        : <span className="text-gray-400">否</span>}
+                                    </td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{row.annualCycles.toFixed(1)}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono">{row.annualEnergyMWh.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                                    <td className="border-b border-gray-100 px-3 py-1.5 font-mono text-blue-700">{yr ? formatNumber(yr.breakdown.spot) : '-'}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                </div>
+              );
+            })()}
 
             {/* ==================== 8. 基础数据 ==================== */}
             {activeSection === 'basics' && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                {/* 数据实时展示舱 // 基础数据与参数 */}
+                <div className="lg:col-span-12">
+                  <div className="rounded-xl shadow-sm border border-slate-700/40 overflow-hidden bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white relative">
+                    <div className="absolute inset-0 opacity-[0.07] pointer-events-none"
+                      style={{ backgroundImage: 'radial-gradient(circle at 25% 30%, #38bdf8 0, transparent 40%), radial-gradient(circle at 75% 70%, #a78bfa 0, transparent 40%)' }} />
+                    <div className="px-4 py-2.5 border-b border-white/10 flex items-center gap-2 relative">
+                      <div className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
+                      </div>
+                      <Activity size={14} className="text-emerald-400" />
+                      <h3 className="font-semibold text-sm tracking-wide">数据实时展示舱</h3>
+                      <span className="text-[11px] text-slate-400 ml-1">基础数据与参数 · LIVE</span>
+                      <span className="ml-auto text-[11px] text-slate-400 font-mono">{new Date().toLocaleString('zh-CN', { hour12: false })}</span>
+                    </div>
+                    <div className="p-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 relative">
+                      {[
+                        { label: '装机功率', value: params.capacityMW.toFixed(1), unit: 'MW', color: 'text-sky-400', icon: Zap },
+                        { label: '系统时长', value: params.systemDuration.toFixed(1), unit: 'h', color: 'text-cyan-400', icon: Gauge },
+                        { label: '装机容量', value: params.capacityMWh.toFixed(1), unit: 'MWh', color: 'text-blue-400', icon: Battery },
+                        { label: '综合效率', value: (params.efficiency*100).toFixed(1), unit: '%', color: 'text-emerald-400', icon: Activity },
+                        { label: '运营年限', value: params.lifeSpan.toFixed(0), unit: '年', color: 'text-amber-400', icon: BookOpen },
+                        { label: '总投资', value: (results.totalInvestment/10000).toFixed(0), unit: '万元', color: 'text-fuchsia-400', icon: DollarSign },
+                      ].map((m, i) => {
+                        const Ic = m.icon;
+                        return (
+                          <div key={i} className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-lg px-3 py-2.5 hover:bg-white/10 transition-colors">
+                            <div className="flex items-center gap-1.5 text-[10px] text-slate-400">
+                              <Ic size={11} className={m.color} />
+                              <span>{m.label}</span>
+                            </div>
+                            <div className="mt-1 flex items-baseline gap-1">
+                              <span className={`font-mono font-bold text-lg ${m.color}`}>{m.value}</span>
+                              <span className="text-[10px] text-slate-400">{m.unit}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
                 <div className="lg:col-span-6 space-y-4">
                   <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
                     <div className="bg-gray-50 px-4 py-3 border-b border-gray-100 flex items-center gap-2">
