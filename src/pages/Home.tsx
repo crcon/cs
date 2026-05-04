@@ -888,10 +888,12 @@ export default function ShandongStorageCalculator() {
       accent: 'bg-rose-400',
       description: '迎峰期顶峰补贴 / 月度滚动结算',
     },
-  ].map(item => ({
-    ...item,
-    percent: firstYearRevenue > 0 ? (item.value / firstYearRevenue) * 100 : 0,
-  }));
+  ]
+    .filter(item => (item.value ?? 0) > 0)
+    .map(item => ({
+      ...item,
+      percent: firstYearRevenue > 0 ? (item.value / firstYearRevenue) * 100 : 0,
+    }));
 
   // 输入控件封装
   const InputField = ({ label, value, onChange, unit, step = 0.01, tooltip }: any) => (
