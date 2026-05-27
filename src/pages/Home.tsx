@@ -1394,7 +1394,55 @@ export default function ShandongStorageCalculator() {
                   </div>
                 </section>
 
-                {/* ===== 4. 项目财务指标 strip · 8 卡 + sparkline ===== */}
+                {/* ===== 4. 收益分析 anchor · 收益流明细卡 ===== */}
+                {(() => {
+                  const visibleRevenue = revenueStructure.filter(item => item.value > 0);
+                  const colClass = visibleRevenue.length <= 2 ? 'xl:grid-cols-2'
+                    : visibleRevenue.length === 3 ? 'xl:grid-cols-3'
+                    : visibleRevenue.length === 4 ? 'xl:grid-cols-4'
+                    : 'xl:grid-cols-5';
+                  return (
+                    <section id="ov-revenue" className="relative overflow-hidden rounded-2xl border border-slate-800/80 bg-[linear-gradient(135deg,_#0a1224_0%,_#0b1830_100%)] p-5 shadow-[0_18px_60px_rgba(8,15,34,0.45)]">
+                      <div className="mb-3 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <BookOpen size={16} className="text-cyan-300" />
+                          <h3 className="text-sm font-semibold text-slate-200">收益流明细 · 五大收入源</h3>
+                        </div>
+                        <span className="text-[11px] text-slate-500">合计 {formatNumber(firstYearRevenue)} 万元 · 占总收入 100%</span>
+                      </div>
+                      <div className={`grid grid-cols-1 gap-3 md:grid-cols-2 ${colClass}`}>
+                        {visibleRevenue.map(item => (
+                          <div key={item.label} className="group relative overflow-hidden rounded-xl border border-white/5 bg-white/[0.03] p-4">
+                            <div className={`absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r ${item.color}`}></div>
+                            <div className={`absolute -right-8 -top-8 h-24 w-24 rounded-full bg-gradient-to-br ${item.color} opacity-15 blur-2xl`}></div>
+                            <div className="relative flex items-start justify-between">
+                              <div>
+                                <p className="text-sm font-semibold text-white">{item.label}</p>
+                                <p className="mt-1 text-[11px] text-slate-400">{item.description}</p>
+                              </div>
+                              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">收益流</span>
+                            </div>
+                            <div className="relative mt-4 flex items-end justify-between">
+                              <div>
+                                <p className="text-2xl font-bold text-white font-mono">{formatNumber(item.value)}</p>
+                                <p className="text-[11px] text-slate-400">万元 / 首年贡献</p>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-[10px] text-slate-500">占比</p>
+                                <p className="mt-0.5 text-sm font-mono text-cyan-200">{item.percent.toFixed(1)}%</p>
+                              </div>
+                            </div>
+                            <div className="relative mt-3 h-1.5 rounded-full bg-white/5 overflow-hidden">
+                              <div className={`h-full rounded-full bg-gradient-to-r ${item.color}`} style={{ width: `${Math.max(item.percent, 2)}%` }}></div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  );
+                })()}
+
+                {/* ===== 5. 项目财务指标 strip · 8 卡 + sparkline ===== */}
                 <section className="relative overflow-hidden rounded-2xl border border-slate-800/80 bg-[linear-gradient(135deg,_#0a1224_0%,_#0b1830_100%)] p-5 shadow-[0_18px_60px_rgba(8,15,34,0.45)]">
                   <div className="mb-3 flex items-center gap-2">
                     <TrendingUp size={16} className="text-cyan-300" />
@@ -1464,45 +1512,6 @@ export default function ShandongStorageCalculator() {
                         <p className="mt-1.5 text-[10px] text-slate-500 leading-tight">{m.hint}</p>
                         <div className="mt-2 -mx-1">
                           <Sparkline data={m.data} stroke={m.spark} fill={m.fill} height={28} />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-
-                {/* ===== 5. 收益分析 anchor · 收益流明细卡 (保留原 5 卡) ===== */}
-                <section id="ov-revenue" className="relative overflow-hidden rounded-2xl border border-slate-800/80 bg-[linear-gradient(135deg,_#0a1224_0%,_#0b1830_100%)] p-5 shadow-[0_18px_60px_rgba(8,15,34,0.45)]">
-                  <div className="mb-3 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <BookOpen size={16} className="text-cyan-300" />
-                      <h3 className="text-sm font-semibold text-slate-200">收益流明细 · 五大收入源</h3>
-                    </div>
-                    <span className="text-[11px] text-slate-500">合计 {formatNumber(firstYearRevenue)} 万元 · 占总收入 100%</span>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
-                    {revenueStructure.map(item => (
-                      <div key={item.label} className="group relative overflow-hidden rounded-xl border border-white/5 bg-white/[0.03] p-4">
-                        <div className={`absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r ${item.color}`}></div>
-                        <div className={`absolute -right-8 -top-8 h-24 w-24 rounded-full bg-gradient-to-br ${item.color} opacity-15 blur-2xl`}></div>
-                        <div className="relative flex items-start justify-between">
-                          <div>
-                            <p className="text-sm font-semibold text-white">{item.label}</p>
-                            <p className="mt-1 text-[11px] text-slate-400">{item.description}</p>
-                          </div>
-                          <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">收益流</span>
-                        </div>
-                        <div className="relative mt-4 flex items-end justify-between">
-                          <div>
-                            <p className="text-2xl font-bold text-white font-mono">{formatNumber(item.value)}</p>
-                            <p className="text-[11px] text-slate-400">万元 / 首年贡献</p>
-                          </div>
-                          <div className="text-right">
-                            <p className="text-[10px] text-slate-500">占比</p>
-                            <p className="mt-0.5 text-sm font-mono text-cyan-200">{item.percent.toFixed(1)}%</p>
-                          </div>
-                        </div>
-                        <div className="relative mt-3 h-1.5 rounded-full bg-white/5 overflow-hidden">
-                          <div className={`h-full rounded-full bg-gradient-to-r ${item.color}`} style={{ width: `${Math.max(item.percent, 2)}%` }}></div>
                         </div>
                       </div>
                     ))}
