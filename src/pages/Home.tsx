@@ -1332,8 +1332,8 @@ export default function ShandongStorageCalculator() {
                           <div className="md:col-span-5 relative h-[240px]">
                             <ResponsiveContainer width="100%" height="100%">
                               <PieChart>
-                                <Pie data={revenueStructure} dataKey="value" innerRadius={56} outerRadius={88} paddingAngle={2} stroke="rgba(255,255,255,0.06)" strokeWidth={1}>
-                                  {revenueStructure.map((d, i) => (<Cell key={i} fill={d.fill} />))}
+                                <Pie data={revenueStructure.filter(d => d.value > 0)} dataKey="value" innerRadius={56} outerRadius={88} paddingAngle={2} stroke="rgba(255,255,255,0.06)" strokeWidth={1}>
+                                  {revenueStructure.filter(d => d.value > 0).map((d, i) => (<Cell key={i} fill={d.fill} />))}
                                 </Pie>
                                 <RechartsTooltip
                                   contentStyle={{ background:'#0b1830', border:'1px solid rgba(255,255,255,0.1)', borderRadius:8, color:'#e2e8f0' }}
@@ -1348,7 +1348,7 @@ export default function ShandongStorageCalculator() {
                             </div>
                           </div>
                           <div className="md:col-span-7 space-y-2">
-                            {revenueStructure.map(item => (
+                            {revenueStructure.filter(item => item.value > 0).map(item => (
                               <div key={item.label} className="flex items-center gap-3 rounded-lg border border-white/5 bg-white/[0.03] px-3 py-2">
                                 <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: item.fill }}></span>
                                 <span className="w-20 text-sm font-medium text-slate-200">{item.label}</span>
